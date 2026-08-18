@@ -1,0 +1,204 @@
+name: Build and publish extensions
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "core/**"
+      - "common/**"
+      - "compiler/**"
+      - "lib/**"
+      - "lib-multisrc/**"
+      - "gradle/**"
+      - "*.gradle.kts"
+      - "gradle.properties"
+      - ".github/scripts/update_public_index.py"
+      - ".github/workflows/build_publish.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mihon-extension-publish
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    env:
+      # Repo público en formato OWNER/REPO.
+      PUBLIC_REPOSITORY: ${{ vars.PUBLIC_REPOSITORY }}
+
+      # Datos del índice. Solo se usan si todavía no existe un index.pb público.
+      STORE_NAME: ${{ vars.STORE_NAME }}
+      STORE_BADGE: ${{ vars.STORE_BADGE }}
+      STORE_CONTACT_URL: ${{ vars.STORE_CONTACT_URL }}
+      SIGNING_KEY_SHA256: ${{ vars.SIGNING_KEY_SHA256 }}
+
+      # Datos privados de firma.
+      ALIAS: ${{ secrets.ALIAS }}
+      KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+      KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+
+      # Token con acceso de escritura ÚNICAMENTE al repo público.
+      GH_TOKEN: ${{ secrets.PUBLIC_REPO_TOKEN }}
+
+    steps:
+      - name: Checkout private source repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Validate configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$PUBLIC_REPOSITORY" || { echo "Missing repository variable: PUBLIC_REPOSITORY"; exit 1; }
+          test -n "$GH_TOKEN" || { echo "Missing secret: PUBLIC_REPO_TOKEN"; exit 1; }
+          test -n "$ALIAS" || { echo "Missing secret: ALIAS"; exit 1; }
+          test -n "$KEY_STORE_PASSWORD" || { echo "Missing secret: KEY_STORE_PASSWORD"; exit 1; }
+          test -n "$KEY_PASSWORD" || { echo "Missing secret: KEY_PASSWORD"; exit 1; }
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Install protobuf runtime
+        run: python -m pip install --disable-pip-version-check "protobuf==7.35.1"
+
+      - name: Restore signing keystore
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.SIGNING_KEY }}" | base64 --decode > signingkey.jks
+          test -s signingkey.jks
+
+      - name: Detect changed extension modules
+        id: changed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            mapfile -t modules < <(
+              find src -mindepth 2 -maxdepth 2 -type d \
+                -exec test -f '{}/build.gradle.kts' ';' -print | sort
+            )
+          else
+            BEFORE="${{ github.event.before }}"
+            AFTER="${{ github.sha }}"
+
+            if [[ -z "$BEFORE" || "$BEFORE" == "0000000000000000000000000000000000000000" ]]; then
+              RANGE="HEAD^ HEAD"
+            else
+              RANGE="$BEFORE $AFTER"
+            fi
+
+            mapfile -t modules < <(
+              git diff --name-only $RANGE \
+                | awk -F/ '$1=="src" && NF>=3 {print $1"/"$2"/"$3}' \
+                | sort -u \
+                | while read -r module; do
+                    [[ -f "$module/build.gradle.kts" ]] && echo "$module"
+                  done
+            )
+
+            # Si cambió infraestructura compartida, compilar todas las extensiones.
+            if git diff --name-only $RANGE | grep -Eq \
+              '^(core/|common/|compiler/|lib/|lib-multisrc/|gradle/|[^/]+\.gradle\.kts$|gradle\.properties$)'; then
+              mapfile -t modules < <(
+                find src -mindepth 2 -maxdepth 2 -type d \
+                  -exec test -f '{}/build.gradle.kts' ';' -print | sort
+              )
+            fi
+          fi
+
+          if (( ${#modules[@]} == 0 )); then
+            echo "No extension modules changed."
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          printf '%s\n' "${modules[@]}" | tee /tmp/changed-modules.txt
+          echo "has_changes=true" >> "$GITHUB_OUTPUT"
+
+      - name: Build changed release modules
+        if: steps.changed.outputs.has_changes == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tasks=()
+          while IFS= read -r module; do
+            gradle_path=":${module//\//:}"
+            tasks+=("${gradle_path}:assembleRelease")
+          done < /tmp/changed-modules.txt
+
+          ./gradlew "${tasks[@]}" \
+            --stacktrace \
+            -PALIAS="$ALIAS" \
+            -PKEY_STORE_PASSWORD="$KEY_STORE_PASSWORD" \
+            -PKEY_PASSWORD="$KEY_PASSWORD"
+
+      - name: Prepare public repository checkout
+        if: steps.changed.outputs.has_changes == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.PUBLIC_REPOSITORY }}
+          token: ${{ secrets.PUBLIC_REPO_TOKEN }}
+          path: _public
+          fetch-depth: 1
+
+      - name: Publish releases and update index
+        if: steps.changed.outputs.has_changes == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # El script:
+          # 1) lee el index.pb público actual si existe,
+          # 2) conserva extensiones no modificadas,
+          # 3) crea/actualiza una Release por extensión,
+          # 4) reemplaza únicamente la entrada correspondiente,
+          # 5) vuelve a generar index.pb.
+          python .github/scripts/update_public_index.py \
+            --modules-file /tmp/changed-modules.txt \
+            --public-dir _public \
+            --public-repository "$PUBLIC_REPOSITORY" \
+            --store-name "${STORE_NAME:-RBK}" \
+            --store-badge "${STORE_BADGE:-RBK}" \
+            --contact-url "${STORE_CONTACT_URL:-https://example.com}" \
+            --signing-key "$SIGNING_KEY_SHA256"
+
+      - name: Commit public index
+        if: steps.changed.outputs.has_changes == 'true'
+        shell: bash
+        working-directory: _public
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add index.pb
+
+          if git diff --cached --quiet; then
+            echo "index.pb unchanged."
+            exit 0
+          fi
+
+          git commit -m "Update extension index"
+          git push
