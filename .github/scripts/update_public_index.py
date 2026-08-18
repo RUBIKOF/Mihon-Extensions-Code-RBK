@@ -102,16 +102,50 @@ def icon_url_for(module: Path, old_extension, metadata: dict) -> str:
 
 
 def normalize_warning(value) -> str:
-    if value is None:
-        return "CONTENT_WARNING_SAFE"
+    """
+    Normalize the content warning emitted by Gradle metadata.
 
-    text = str(value).upper()
+    Supported numeric values:
+      0 = UNSPECIFIED
+      1 = SAFE
+      2 = MIXED
+      3 = NSFW
+
+    Text values are also accepted for compatibility.
+    """
+    if value is None:
+        return "CONTENT_WARNING_UNSPECIFIED"
+
+    if isinstance(value, bool):
+        return "CONTENT_WARNING_UNSPECIFIED"
+
+    if isinstance(value, int):
+        return {
+            0: "CONTENT_WARNING_UNSPECIFIED",
+            1: "CONTENT_WARNING_SAFE",
+            2: "CONTENT_WARNING_MIXED",
+            3: "CONTENT_WARNING_NSFW",
+        }.get(value, "CONTENT_WARNING_UNSPECIFIED")
+
+    text = str(value).strip().upper()
+
+    if text.isdigit():
+        return {
+            "0": "CONTENT_WARNING_UNSPECIFIED",
+            "1": "CONTENT_WARNING_SAFE",
+            "2": "CONTENT_WARNING_MIXED",
+            "3": "CONTENT_WARNING_NSFW",
+        }.get(text, "CONTENT_WARNING_UNSPECIFIED")
+
     if "NSFW" in text:
         return "CONTENT_WARNING_NSFW"
     if "MIXED" in text:
         return "CONTENT_WARNING_MIXED"
     if "SAFE" in text:
         return "CONTENT_WARNING_SAFE"
+    if "UNSPECIFIED" in text:
+        return "CONTENT_WARNING_UNSPECIFIED"
+
     return "CONTENT_WARNING_UNSPECIFIED"
 
 
