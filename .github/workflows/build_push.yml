@@ -14,7 +14,7 @@ on:
       - "*.gradle.kts"
       - "gradle.properties"
       - ".github/scripts/update_public_index.py"
-      - ".github/workflows/build_publish.yml"
+      - ".github/workflows/build_push.yml"
   workflow_dispatch:
 
 permissions:
