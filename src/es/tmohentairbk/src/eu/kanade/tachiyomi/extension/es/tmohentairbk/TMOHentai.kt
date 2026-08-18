@@ -28,7 +28,7 @@ abstract class TMOHentai :
 
     private val preferences: SharedPreferences by getPreferencesLazy()
 
-    //private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
+    private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
 
     override fun popularMangaRequest(page: Int): Request {
         val url = if (page == 1) {
