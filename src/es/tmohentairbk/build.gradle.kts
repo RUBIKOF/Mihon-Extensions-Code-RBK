@@ -5,7 +5,7 @@ plugins {
 }
 
 keiyoushi {
-    name = "TMOHentai"
+    name = "TMOHentaiRBK"
     versionCode = 1
     contentWarning = ContentWarning.NSFW
     libVersion = "1.4"
