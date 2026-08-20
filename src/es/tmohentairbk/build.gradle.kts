@@ -11,7 +11,7 @@ keiyoushi {
     libVersion = "1.6"
 
     source {
-        name = "TMOHentaiRBK"
+        name = "TMOHentai"
         lang = "es"
         baseUrl = "https://tmohentai.app"
         id = 6842739150264187391L
