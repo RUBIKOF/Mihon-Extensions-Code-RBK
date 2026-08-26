@@ -343,7 +343,27 @@ abstract class Hitomi : KeiSource() {
         )
     }
 
-    override suspend fun getMangaByUrl(url: HttpUrl): SManga? = null
+    override suspend fun getMangaByUrl(
+        url: HttpUrl,
+    ): SManga? {
+        if (url.host != baseUrl.toHttpUrl().host) {
+            return null
+        }
+
+        val galleryId = extractGalleryId(
+            url.toString(),
+        ) ?: return null
+
+        val blockHtml = client
+            .get("$dataBaseUrl/galleryblock/$galleryId.html")
+            .body
+            .string()
+
+        return parseSearchBlock(
+            html = blockHtml,
+            documentBase = baseUrl,
+        )
+    }
 
     override suspend fun fetchMangaUpdate(
         manga: SManga,
@@ -502,11 +522,6 @@ abstract class Hitomi : KeiSource() {
     override suspend fun getPageList(chapter: SChapter): List<Page> {
         val chapterUrl = getChapterUrl(chapter)
 
-        println(
-            "RBK_READER_INSTANCE=" +
-                System.identityHashCode(this),
-        )
-
         val galleryId = galleryIdRegex
             .find(chapterUrl)
             ?.groupValues
@@ -518,31 +533,137 @@ abstract class Hitomi : KeiSource() {
             .body
             .string()
 
-        val galleryFingerprint = MessageDigest
-            .getInstance("SHA-256")
-            .digest(galleryScript.toByteArray(Charsets.UTF_8))
-            .take(4)
-            .joinToString("") {
-                "%02x".format(it)
+        val galleryInfo = parseGalleryInfo(galleryScript)
+            ?: return emptyList()
+
+        val files = galleryInfo
+            .optJSONArray("files")
+            ?: return emptyList()
+
+        return buildList {
+            for (index in 0 until files.length()) {
+                val file = files.optJSONObject(index)
+                    ?: continue
+
+                val hash = file
+                    .optString("hash")
+                    .trim()
+
+                if (hash.isBlank()) {
+                    continue
+                }
+
+                val isGif = file
+                    .optString("name")
+                    .endsWith(
+                        suffix = ".gif",
+                        ignoreCase = true,
+                    )
+
+                add(
+                    Page(
+                        index = index,
+                        url = buildString {
+                            append(chapterUrl)
+                            append("#hash=")
+                            append(hash)
+                            append("&gif=")
+                            append(isGif)
+                        },
+                    ),
+                )
             }
+        }
+    }
 
-        val hashes = hashRegex
-            .findAll(galleryScript)
-            .map { it.groupValues[1] }
-            .toList()
+    override suspend fun getImageUrl(page: Page): String {
+        val metadata = page.url
+            .substringAfter(
+                delimiter = '#',
+                missingDelimiterValue = "",
+            )
 
-        println("RBK_READER_GALLERY_FP=$galleryFingerprint")
-        println("RBK_READER_HASH_COUNT=${hashes.size}")
+        val hash = readerHashRegex
+            .find(metadata)
+            ?.groupValues
+            ?.get(1)
+            ?: return ""
 
-        if (hashes.isEmpty()) {
-            return emptyList()
+        val isGif = readerGifRegex
+            .find(metadata)
+            ?.groupValues
+            ?.get(1)
+            ?.toBooleanStrictOrNull()
+            ?: false
+
+        refreshImageScript()
+
+        val imageId = hashSegment(hash)
+
+        val subdomainOffset = imageSubdomainOffsetMap[imageId]
+            ?: imageSubdomainOffsetDefault
+
+        val type = if (isGif) {
+            "webp"
+        } else {
+            "avif"
         }
 
-        val ggUrl = "$dataBaseUrl/gg.js".toHttpUrl()
+        val subdomain = if (isGif) {
+            "w${subdomainOffset + 1}"
+        } else {
+            "a${subdomainOffset + 1}"
+        }
+
+        val imageDomain = dataBaseUrl
+            .toHttpUrl()
+            .host
+            .substringAfter('.')
+
+        return "https://$subdomain.$imageDomain/" +
+            "$imageCommonId$imageId/$hash.$type"
+    }
+
+    override fun getFilterList(data: JsonElement?): FilterList = Filters.getFilterList(lang)
+
+    override fun imageRequest(page: Page): Request = super.imageRequest(page)
+        .newBuilder()
+        .header(
+            "Accept",
+            "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        )
+        .header(
+            "Referer",
+            page.url.substringBefore('#'),
+        )
+        .build()
+
+    private var cachedGalleriesVersion: String? = null
+    private var cachedGalleriesVersionAt = 0L
+    private var cachedGalleriesVersionDataBase: String? = null
+
+    private val imageScriptMutex = Mutex()
+    private var imageScriptLastRetrieval = 0L
+    private var imageSubdomainOffsetDefault = 1
+    private val imageSubdomainOffsetMap = mutableMapOf<Int, Int>()
+    private var imageCommonId = ""
+
+    private suspend fun refreshImageScript() = imageScriptMutex.withLock {
+        val now = System.currentTimeMillis()
+
+        if (
+            imageCommonId.isNotBlank() &&
+            now - imageScriptLastRetrieval < 60_000L
+        ) {
+            return@withLock
+        }
+
+        val ggUrl = "$dataBaseUrl/gg.js"
+            .toHttpUrl()
             .newBuilder()
             .addQueryParameter(
                 "_",
-                System.currentTimeMillis().toString(),
+                now.toString(),
             )
             .build()
 
@@ -550,81 +671,52 @@ abstract class Hitomi : KeiSource() {
             .get(
                 ggUrl,
                 headers = headers.newBuilder()
-                    .set("Referer", chapterUrl)
+                    .set("Referer", "$baseUrl/")
                     .build(),
             )
             .body
             .string()
 
-        val ggFingerprint = MessageDigest
-            .getInstance("SHA-256")
-            .digest(ggScript.toByteArray(Charsets.UTF_8))
-            .take(4)
-            .joinToString("") {
-                "%02x".format(it)
-            }
-
-        val ggBase = ggBaseRegex
+        val defaultOffset = ggDefaultOffsetRegex
             .find(ggScript)
             ?.groupValues
             ?.get(1)
-            ?: run {
-                println("RBK_READER_GG_BASE_PRESENT=false")
-                return emptyList()
-            }
+            ?.toIntOrNull()
+            ?: return@withLock
 
-        val ggCases = ggCaseRegex
+        val caseOffset = ggCaseOffsetRegex
+            .find(ggScript)
+            ?.groupValues
+            ?.get(1)
+            ?.toIntOrNull()
+            ?: return@withLock
+
+        val commonId = ggBaseRegex
+            .find(ggScript)
+            ?.groupValues
+            ?.get(1)
+            ?: return@withLock
+
+        imageSubdomainOffsetDefault = defaultOffset
+
+        imageSubdomainOffsetMap.clear()
+
+        ggCaseRegex
             .findAll(ggScript)
-            .map { it.groupValues[1].toInt() }
-            .toHashSet()
+            .forEach {
+                val imageId = it
+                    .groupValues
+                    .getOrNull(1)
+                    ?.toIntOrNull()
+                    ?: return@forEach
 
-        println("RBK_READER_GG_FP=$ggFingerprint")
-        println("RBK_READER_GG_LENGTH=${ggScript.length}")
-        println("RBK_READER_GG_CASE_COUNT=${ggCases.size}")
-        println("RBK_READER_GG_BASE_PRESENT=true")
-
-        val imageDomain = dataBaseUrl
-            .toHttpUrl()
-            .host
-            .substringAfter('.')
-
-        val pages = hashes.mapIndexed { index, hash ->
-            val segment = hashSegment(hash)
-
-            val server = if (segment in ggCases) {
-                2
-            } else {
-                1
+                imageSubdomainOffsetMap[imageId] =
+                    caseOffset
             }
 
-            if (index < 3) {
-                println(
-                    "RBK_READER_PAGE[$index]_SEGMENT=$segment",
-                )
-                println(
-                    "RBK_READER_PAGE[$index]_SERVER=$server",
-                )
-            }
-
-            Page(
-                index = index,
-                imageUrl = "https://w$server.$imageDomain/$ggBase$segment/$hash.webp",
-            )
-        }
-
-        return pages
+        imageCommonId = commonId
+        imageScriptLastRetrieval = now
     }
-
-    override fun getFilterList(data: JsonElement?): FilterList = Filters.getFilterList(lang)
-
-    override fun imageRequest(page: Page): Request = super.imageRequest(page)
-        .newBuilder()
-        .header("Referer", "$baseUrl/")
-        .build()
-
-    private var cachedGalleriesVersion: String? = null
-    private var cachedGalleriesVersionAt = 0L
-    private var cachedGalleriesVersionDataBase: String? = null
 
     private suspend fun getCachedGalleriesVersion(
         dataBase: String,
@@ -776,6 +868,10 @@ abstract class Hitomi : KeiSource() {
     private val hashRegex = Regex(""""hash"\s*:\s*"([0-9a-f]+)"""")
     private val ggCaseRegex = Regex("""case\s+(\d+)\s*:""")
     private val ggBaseRegex = Regex("""\bb\s*:\s*['"]([^'"]+)['"]""")
+    private val ggDefaultOffsetRegex = Regex("""var\s+o\s*=\s*(\d+)""")
+    private val ggCaseOffsetRegex = Regex("""o\s*=\s*(\d+)\s*;\s*break\s*;""")
+    private val readerHashRegex = Regex("""(?:^|&)hash=([0-9a-f]+)(?:&|$)""")
+    private val readerGifRegex = Regex("""(?:^|&)gif=(true|false)(?:&|$)""")
 
     private val popularPath: String
         get() = when (lang) {

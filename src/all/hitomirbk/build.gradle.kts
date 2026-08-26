@@ -5,8 +5,8 @@ plugins {
 }
 
 keiyoushi {
-    name = "HitomiRBK"
-    versionCode = 1
+    name = "Hitomi"
+    versionCode = 2
     contentWarning = ContentWarning.NSFW
     libVersion = "1.6"
 
@@ -18,7 +18,7 @@ keiyoushi {
         "th", "my", "ko", "zh", "ja",
     ).forEach { sourceLang ->
         source {
-            name = "HitomiRBK"
+            name = "Hitomi"
             lang = sourceLang
             baseUrl = "https://hitomi.la"
         }

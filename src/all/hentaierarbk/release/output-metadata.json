@@ -4,16 +4,16 @@
     "type": "APK",
     "kind": "Directory"
   },
-  "applicationId": "eu.kanade.tachiyomi.extension.all.hitomirbk",
+  "applicationId": "eu.kanade.tachiyomi.extension.all.hentaierarbk",
   "variantName": "release",
   "elements": [
     {
       "type": "SINGLE",
       "filters": [],
       "attributes": [],
-      "versionCode": 2,
-      "versionName": "1.6.2",
-      "outputFile": "tachiyomi-all.hitomirbk-v1.6.2.apk"
+      "versionCode": 1,
+      "versionName": "1.6.1",
+      "outputFile": "tachiyomi-all.hentaierarbk-v1.6.1.apk"
     }
   ],
   "elementType": "File",
