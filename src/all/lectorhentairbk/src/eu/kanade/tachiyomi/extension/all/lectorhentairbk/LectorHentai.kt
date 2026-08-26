@@ -22,7 +22,6 @@ abstract class LectorHentai : KeiSource() {
 
     private val pageSize = 25
 
-
     override suspend fun getPopularManga(page: Int): MangasPage = getListing(
         page = page,
         popular = true,

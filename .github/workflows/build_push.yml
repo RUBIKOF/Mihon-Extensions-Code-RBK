@@ -19,6 +19,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: mihon-extension-publish
@@ -50,7 +51,17 @@ jobs:
       - name: Checkout private source repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          # Necesitamos todo el historial para poder comparar contra
+          # el último workflow publicado exitosamente.
+          fetch-depth: 0
+
+      - name: Get last successful publish commit
+        if: github.event_name == 'push'
+        uses: nrwl/nx-set-shas@v5
+        with:
+          # Si todavía nunca hubo un workflow exitoso, comparar contra
+          # el árbol vacío para considerar todo el repositorio.
+          fallback-sha: 4b825dc642cb6eb9a060e54bf8d69288fbee4904
 
       - name: Validate configuration
         shell: bash
@@ -93,22 +104,32 @@ jobs:
           set -euo pipefail
 
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            # Ejecución manual: compilar todas las extensiones.
             mapfile -t modules < <(
               find src -mindepth 2 -maxdepth 2 -type d \
                 -exec test -f '{}/build.gradle.kts' ';' -print | sort
             )
           else
-            BEFORE="${{ github.event.before }}"
+            BASE="${NX_BASE:-}"
             AFTER="${{ github.sha }}"
 
-            if [[ -z "$BEFORE" || "$BEFORE" == "0000000000000000000000000000000000000000" ]]; then
-              RANGE="HEAD^ HEAD"
-            else
-              RANGE="$BEFORE $AFTER"
+            if [[ -z "$BASE" ]]; then
+              echo "NX_BASE is empty; cannot determine last successful publish commit."
+              exit 1
             fi
 
+            echo "Last successful publish commit: $BASE"
+            echo "Current commit:                 $AFTER"
+            echo "Diff range:                     $BASE..$AFTER"
+
+            mapfile -t changed_files < <(
+              git diff --name-only "$BASE" "$AFTER"
+            )
+
+            printf '%s\n' "${changed_files[@]}"
+
             mapfile -t modules < <(
-              git diff --name-only $RANGE \
+              printf '%s\n' "${changed_files[@]}" \
                 | awk -F/ '$1=="src" && NF>=3 {print $1"/"$2"/"$3}' \
                 | sort -u \
                 | while read -r module; do
@@ -116,8 +137,9 @@ jobs:
                   done
             )
 
-            # Si cambió infraestructura compartida, compilar todas las extensiones.
-            if git diff --name-only $RANGE | grep -Eq \
+            # Si cambió infraestructura compartida desde el último publish
+            # exitoso, compilar todas las extensiones.
+            if printf '%s\n' "${changed_files[@]}" | grep -Eq \
               '^(core/|common/|compiler/|lib/|lib-multisrc/|gradle/|[^/]+\.gradle\.kts$|gradle\.properties$)'; then
               mapfile -t modules < <(
                 find src -mindepth 2 -maxdepth 2 -type d \
@@ -127,7 +149,7 @@ jobs:
           fi
 
           if (( ${#modules[@]} == 0 )); then
-            echo "No extension modules changed."
+            echo "No extension modules changed since the last successful publish."
             echo "has_changes=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
