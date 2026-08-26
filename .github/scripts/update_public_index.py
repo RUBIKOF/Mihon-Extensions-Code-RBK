@@ -67,6 +67,13 @@ def load_index(path: Path, *, name: str, badge: str, signing_key: str, contact_u
         except gzip.BadGzipFile:
             pass
         index.ParseFromString(raw)
+
+        # Las variables del repositorio privado son la fuente de verdad
+        # para la metadata global del índice, incluso si index.pb ya existe.
+        index.name = name
+        index.badgeLabel = badge
+        index.signingKey = signing_key
+        index.contact.website = contact_url
         return index
 
     index.name = name
