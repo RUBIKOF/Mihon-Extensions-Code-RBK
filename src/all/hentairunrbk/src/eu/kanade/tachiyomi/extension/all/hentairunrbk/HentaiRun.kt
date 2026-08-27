@@ -128,13 +128,24 @@ abstract class HentaiRun : KeiSource() {
 
         val nextPage = page + 1
 
-        val hasNextPage = document
+        val hasNextPageByLink = document
             .select("a[href]")
             .any { element ->
                 val href = element.attr("href")
                 href.contains("/page/$nextPage/") ||
                     href.contains("page=$nextPage")
             }
+
+        val hasNextPageByButton = document
+            .select("nav button")
+            .any { button ->
+                val text = button.text().trim()
+
+                (!button.hasAttr("disabled") && text.equals("Next ›", ignoreCase = true)) ||
+                    (text.toIntOrNull()?.let { it > page } == true)
+            }
+
+        val hasNextPage = hasNextPageByLink || hasNextPageByButton
 
         return MangasPage(
             mangas = mangas,

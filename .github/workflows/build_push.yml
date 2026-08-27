@@ -195,7 +195,8 @@ jobs:
           # 2) conserva extensiones no modificadas,
           # 3) crea/actualiza una Release por extensión,
           # 4) reemplaza únicamente la entrada correspondiente,
-          # 5) vuelve a generar index.pb.
+          # 5) vuelve a generar index.pb,
+          # 6) actualiza el badge, resumen y tabla del README público.
           python .github/scripts/update_public_index.py \
             --modules-file /tmp/changed-modules.txt \
             --public-dir _public \
@@ -205,7 +206,7 @@ jobs:
             --contact-url "${STORE_CONTACT_URL:-https://example.com}" \
             --signing-key "$SIGNING_KEY_SHA256"
 
-      - name: Commit public index
+      - name: Commit public index and README
         if: steps.changed.outputs.has_changes == 'true'
         shell: bash
         working-directory: _public
@@ -215,12 +216,12 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add index.pb
+          git add index.pb README.md
 
           if git diff --cached --quiet; then
-            echo "index.pb unchanged."
+            echo "index.pb and README.md unchanged."
             exit 0
           fi
 
-          git commit -m "Update extension index"
+          git commit -m "Update extension index and README"
           git push

@@ -3,9 +3,7 @@
 import argparse
 import gzip
 import json
-import os
 import re
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -274,6 +272,172 @@ def gh_release(repository: str, tag: str, title: str, apk: Path, jar: Path | Non
         )
 
 
+
+README_TABLE_START = "<!-- RBK_EXTENSIONS_TABLE_START -->"
+README_TABLE_END = "<!-- RBK_EXTENSIONS_TABLE_END -->"
+
+
+LANGUAGE_DISPLAY = {
+    "es": "🇪🇸 Español",
+    "en": "🇬🇧 Inglés",
+    "ja": "🇯🇵 Japonés",
+    "fr": "🇫🇷 Francés",
+    "de": "🇩🇪 Alemán",
+    "ru": "🇷🇺 Ruso",
+    "ko": "🇰🇷 Coreano",
+    "pt": "🇵🇹 Portugués",
+    "it": "🇮🇹 Italiano",
+    "zh": "🇨🇳 Chino",
+    "ar": "🇸🇦 Árabe",
+    "tr": "🇹🇷 Turco",
+    "id": "🇮🇩 Indonesio",
+    "vi": "🇻🇳 Vietnamita",
+    "pl": "🇵🇱 Polaco",
+    "nl": "🇳🇱 Neerlandés",
+    "th": "🇹🇭 Tailandés",
+}
+
+
+def extension_languages(extension) -> list[str]:
+    languages = {
+        str(source.language).strip().lower()
+        for source in extension.sources
+        if str(source.language).strip()
+    }
+    return sorted(languages)
+
+
+def coverage_for(extension) -> tuple[str, bool]:
+    languages = extension_languages(extension)
+
+    # "all" representa una fuente global/multi-idioma.
+    if "all" in languages or len(languages) > 1:
+        return "🌐 Multi-idioma", True
+
+    if not languages:
+        return "❔ Sin idioma", False
+
+    lang = languages[0]
+    return LANGUAGE_DISPLAY.get(lang, f"🌐 {lang.upper()}"), False
+
+
+def markdown_cell(value: str) -> str:
+    return str(value).replace("|", r"\|").replace("\n", " ").strip()
+
+
+def replace_marked_section(
+    text: str,
+    start_marker: str,
+    end_marker: str,
+    content: str,
+) -> str:
+    pattern = re.compile(
+        re.escape(start_marker) + r".*?" + re.escape(end_marker),
+        re.DOTALL,
+    )
+
+    if not pattern.search(text):
+        raise RuntimeError(
+            f"README marker block not found: {start_marker} ... {end_marker}"
+        )
+
+    replacement = f"{start_marker}\n{content.rstrip()}\n{end_marker}"
+    return pattern.sub(lambda _: replacement, text, count=1)
+
+
+def update_public_readme(
+    readme_path: Path,
+    index: Index,
+    *,
+    public_repository: str,
+) -> None:
+    if not readme_path.exists():
+        raise FileNotFoundError(
+            f"Public README not found: {readme_path}. "
+            "Add README.md with the RBK marker blocks before publishing."
+        )
+
+    extensions = list(index.extensionList.extensions)
+    extension_count = len(extensions)
+
+    extensions_badge = (
+        "[![Extensions]"
+        f"(https://img.shields.io/badge/EXTENSIONS-{extension_count}-22c55e"
+        "?style=for-the-badge)]"
+        f"(https://github.com/{public_repository}/releases)"
+    )
+
+    extensions_count_line = (
+        f"**{extension_count} extensiones · múltiples idiomas · "
+        "actualizaciones desde Mihon**"
+    )
+
+    rows = []
+    for extension in extensions:
+        coverage, is_multi = coverage_for(extension)
+        rows.append(
+            (
+                0 if is_multi else 1,
+                extension.name.casefold(),
+                extension.name,
+                coverage,
+                extension.versionName,
+            )
+        )
+
+    rows.sort(key=lambda item: (item[0], item[1]))
+
+    table_lines = [
+        "| Extensión | Cobertura | Versión |",
+        "|---|---|---|",
+    ]
+
+    for _, _, name, coverage, version_name in rows:
+        table_lines.append(
+            "| "
+            + " | ".join(
+                [
+                    markdown_cell(name),
+                    markdown_cell(coverage),
+                    markdown_cell(version_name),
+                ]
+            )
+            + " |"
+        )
+
+    readme = readme_path.read_text(encoding="utf-8")
+    badge_pattern = re.compile(
+        r"\[!\[Extensions\]\(https://img\.shields\.io/badge/EXTENSIONS-\d+-22c55e"
+        r"\?style=for-the-badge\)\]\(https://github\.com/[^)]+/releases\)"
+    )
+    readme, badge_replacements = badge_pattern.subn(
+        extensions_badge,
+        readme,
+        count=1,
+    )
+    if badge_replacements != 1:
+        raise RuntimeError("Extensions badge not found in public README.")
+
+    count_pattern = re.compile(
+        r"\*\*\d+ extensiones · múltiples idiomas · actualizaciones desde Mihon\*\*"
+    )
+    readme, count_replacements = count_pattern.subn(
+        extensions_count_line,
+        readme,
+        count=1,
+    )
+    if count_replacements != 1:
+        raise RuntimeError("Extensions count line not found in public README.")
+
+    readme = replace_marked_section(
+        readme,
+        README_TABLE_START,
+        README_TABLE_END,
+        "\n".join(table_lines),
+    )
+
+    readme_path.write_text(readme, encoding="utf-8")
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--modules-file", required=True)
@@ -287,6 +451,7 @@ def main():
 
     public_dir = Path(args.public_dir).resolve()
     index_path = public_dir / "index.pb"
+    readme_path = public_dir / "README.md"
 
     index = load_index(
         index_path,
@@ -374,7 +539,14 @@ def main():
     raw = rebuilt.SerializeToString(deterministic=True)
     index_path.write_bytes(gzip.compress(raw, mtime=0))
 
+    update_public_readme(
+        readme_path,
+        rebuilt,
+        public_repository=args.public_repository,
+    )
+
     print(f"Updated: {index_path}")
+    print(f"Updated: {readme_path}")
     for pkg in sorted(updated_json_by_pkg):
         print(f"Published: {pkg}")
 
