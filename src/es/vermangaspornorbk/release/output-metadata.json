@@ -4,16 +4,16 @@
     "type": "APK",
     "kind": "Directory"
   },
-  "applicationId": "eu.kanade.tachiyomi.extension.es.tmohentairbk",
+  "applicationId": "eu.kanade.tachiyomi.extension.es.vermangaspornorbk",
   "variantName": "release",
   "elements": [
     {
       "type": "SINGLE",
       "filters": [],
       "attributes": [],
-      "versionCode": 2,
-      "versionName": "1.6.2",
-      "outputFile": "tachiyomi-es.tmohentairbk-v1.6.2.apk"
+      "versionCode": 1,
+      "versionName": "1.6.1",
+      "outputFile": "tachiyomi-es.vermangaspornorbk-v1.6.1.apk"
     }
   ],
   "elementType": "File",

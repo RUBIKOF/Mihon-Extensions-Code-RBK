@@ -6,6 +6,7 @@ import json
 import re
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from google.protobuf import json_format
@@ -272,6 +273,58 @@ def gh_release(repository: str, tag: str, title: str, apk: Path, jar: Path | Non
         )
 
 
+def release_date_for(extension, repository: str) -> str:
+    """
+    Return the publication date of the exact GitHub Release used by the
+    extension currently stored in index.pb.
+
+    Tag format must match gh_release():
+        <slug-from-package>-v<versionCode>
+
+    If the release cannot be found or its date cannot be parsed, return "—"
+    without aborting the README update.
+    """
+    try:
+        package_name = str(extension.packageName).strip()
+        version_code = str(extension.versionCode).strip()
+
+        if not package_name or not version_code:
+            return "—"
+
+        slug = slug_from_package(package_name)
+        tag = f"{slug}-v{version_code}"
+
+        published_at = run(
+            "gh",
+            "release",
+            "view",
+            tag,
+            "--repo",
+            repository,
+            "--json",
+            "publishedAt",
+            "--jq",
+            ".publishedAt",
+        ).strip()
+
+        if not published_at:
+            return "—"
+
+        parsed = datetime.fromisoformat(
+            published_at.replace("Z", "+00:00")
+        )
+
+        return parsed.strftime("%d/%m/%Y")
+
+    except (
+        subprocess.CalledProcessError,
+        ValueError,
+        TypeError,
+        AttributeError,
+    ):
+        return "—"
+
+
 
 README_TABLE_START = "<!-- RBK_EXTENSIONS_TABLE_START -->"
 README_TABLE_END = "<!-- RBK_EXTENSIONS_TABLE_END -->"
@@ -375,6 +428,12 @@ def update_public_readme(
     rows = []
     for extension in extensions:
         coverage, is_multi = coverage_for(extension)
+
+        updated_at = release_date_for(
+            extension,
+            public_repository,
+        )
+
         rows.append(
             (
                 0 if is_multi else 1,
@@ -382,17 +441,18 @@ def update_public_readme(
                 extension.name,
                 coverage,
                 extension.versionName,
+                updated_at,
             )
         )
 
     rows.sort(key=lambda item: (item[0], item[1]))
 
     table_lines = [
-        "| Extensión | Cobertura | Versión |",
-        "|---|---|---|",
+        "| Extensión | Cobertura | Versión | Actualización |",
+        "|---|---|---|---|",
     ]
 
-    for _, _, name, coverage, version_name in rows:
+    for _, _, name, coverage, version_name, updated_at in rows:
         table_lines.append(
             "| "
             + " | ".join(
@@ -400,6 +460,7 @@ def update_public_readme(
                     markdown_cell(name),
                     markdown_cell(coverage),
                     markdown_cell(version_name),
+                    markdown_cell(updated_at),
                 ]
             )
             + " |"
