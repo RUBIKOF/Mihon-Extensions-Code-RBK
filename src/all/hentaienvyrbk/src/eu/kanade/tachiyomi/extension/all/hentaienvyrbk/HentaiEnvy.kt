@@ -13,12 +13,259 @@ import keiyoushi.source.KeiSource
 import kotlinx.serialization.json.JsonElement
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.Interceptor
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.OkHttpClient
+import okhttp3.Protocol
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 @Source
 abstract class HentaiEnvy : KeiSource() {
+
+    override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder = addInterceptor(ReaderPreloadInterceptor())
+
+    private data class CachedImage(
+        val bytes: ByteArray,
+        val contentType: String?,
+    )
+
+    private class PreloadSlot {
+        val ready = CountDownLatch(1)
+
+        @Volatile
+        var image: CachedImage? = null
+    }
+
+    private val preloadExecutor by lazy {
+        Executors.newFixedThreadPool(PRELOAD_WINDOW)
+    }
+
+    private val preloadSlots by lazy {
+        ConcurrentHashMap<String, PreloadSlot>()
+    }
+
+    private val preloadCalls by lazy {
+        ConcurrentHashMap<String, okhttp3.Call>()
+    }
+
+    private val preloadLock by lazy {
+        Any()
+    }
+
+    @Volatile
+    private var preloadUrls: List<String> = emptyList()
+
+    @Volatile
+    private var preloadOrder: List<Int> = emptyList()
+
+    @Volatile
+    private var nextPreloadOrderIndex = 0
+
+    @Volatile
+    private var preloadGeneration = 0L
+
+    @Volatile
+    private var lastReaderIndex: Int? = null
+
+    @Volatile
+    private var readerDirection = 1
+
+    private inner class ReaderPreloadInterceptor : Interceptor {
+        override fun intercept(chain: Interceptor.Chain): Response {
+            val original = chain.request()
+
+            if (original.header(PRELOAD_HEADER) != null) {
+                return chain.proceed(
+                    original.newBuilder()
+                        .removeHeader(PRELOAD_HEADER)
+                        .build(),
+                )
+            }
+
+            val url = original.url.toString()
+            val index = preloadUrls.indexOf(url)
+
+            if (index >= 0) {
+                updateReaderPosition(index)
+            }
+
+            val slot = preloadSlots[url] ?: return chain.proceed(original)
+
+            val ready = runCatching {
+                slot.ready.await(PRELOAD_WAIT_SECONDS, TimeUnit.SECONDS)
+            }.getOrDefault(false)
+
+            val cached = if (ready) slot.image else null
+
+            if (cached == null) {
+                preloadSlots.remove(url, slot)
+                scheduleNextPreload()
+                return chain.proceed(original)
+            }
+
+            preloadSlots.remove(url, slot)
+            scheduleNextPreload()
+
+            val mediaType = cached.contentType
+                ?.takeIf { it.isNotBlank() }
+                ?.toMediaTypeOrNull()
+
+            return Response.Builder()
+                .request(original)
+                .protocol(Protocol.HTTP_1_1)
+                .code(200)
+                .message("OK")
+                .body(cached.bytes.toResponseBody(mediaType))
+                .build()
+        }
+    }
+
+    private fun preparePreload(urls: List<String>) {
+        synchronized(preloadLock) {
+            cancelActivePreloadsLocked()
+            preloadSlots.clear()
+            preloadUrls = urls
+            lastReaderIndex = null
+            readerDirection = 1
+            setPreloadOrderLocked(anchor = 0, direction = 1)
+
+            repeat(minOf(PRELOAD_WINDOW, preloadOrder.size)) {
+                scheduleNextPreloadLocked()
+            }
+        }
+    }
+
+    private fun updateReaderPosition(index: Int) {
+        synchronized(preloadLock) {
+            val previous = lastReaderIndex
+
+            if (previous == null) {
+                lastReaderIndex = index
+                return
+            }
+
+            val delta = index - previous
+            if (delta == 0) return
+
+            val newDirection = if (delta > 0) 1 else -1
+            val directionChanged = newDirection != readerDirection
+            val jumped = kotlin.math.abs(delta) > 1
+            val targetAlreadyTracked = preloadSlots.containsKey(preloadUrls[index])
+
+            lastReaderIndex = index
+
+            if (directionChanged || jumped || !targetAlreadyTracked) {
+                readerDirection = newDirection
+                cancelActivePreloadsLocked()
+                preloadSlots.clear()
+                setPreloadOrderLocked(anchor = index, direction = newDirection)
+
+                repeat(minOf(PRELOAD_WINDOW, preloadOrder.size)) {
+                    scheduleNextPreloadLocked()
+                }
+            }
+        }
+    }
+
+    private fun setPreloadOrderLocked(anchor: Int, direction: Int) {
+        preloadGeneration++
+
+        preloadOrder = if (direction > 0) {
+            (anchor until preloadUrls.size).toList()
+        } else {
+            (anchor downTo 0).toList()
+        }
+
+        nextPreloadOrderIndex = 0
+    }
+
+    private fun cancelActivePreloadsLocked() {
+        preloadCalls.values.forEach { it.cancel() }
+        preloadCalls.clear()
+    }
+
+    private fun scheduleNextPreload() {
+        synchronized(preloadLock) {
+            scheduleNextPreloadLocked()
+        }
+    }
+
+    private fun scheduleNextPreloadLocked() {
+        while (nextPreloadOrderIndex < preloadOrder.size) {
+            val index = preloadOrder[nextPreloadOrderIndex++]
+            val url = preloadUrls[index]
+            val slot = PreloadSlot()
+            val generation = preloadGeneration
+
+            if (preloadSlots.putIfAbsent(url, slot) != null) {
+                continue
+            }
+
+            preloadExecutor.execute {
+                if (generation != preloadGeneration) {
+                    preloadSlots.remove(url, slot)
+                    slot.ready.countDown()
+                    return@execute
+                }
+
+                val parsedUrl = runCatching { url.toHttpUrl() }.getOrNull()
+
+                if (parsedUrl == null) {
+                    preloadSlots.remove(url, slot)
+                    slot.ready.countDown()
+                    scheduleNextPreload()
+                    return@execute
+                }
+
+                var call: okhttp3.Call? = null
+
+                try {
+                    val request = Request.Builder()
+                        .url(parsedUrl)
+                        .headers(headers)
+                        .header(PRELOAD_HEADER, "1")
+                        .get()
+                        .build()
+
+                    call = client.newCall(request)
+                    preloadCalls[url] = call
+
+                    call.execute().use { response ->
+                        if (
+                            generation == preloadGeneration &&
+                            response.isSuccessful
+                        ) {
+                            slot.image = CachedImage(
+                                bytes = response.body.bytes(),
+                                contentType = response.header("Content-Type"),
+                            )
+                        }
+                    }
+                } catch (_: Exception) {
+                    // Fallback: Mihon hará la descarga normal.
+                } finally {
+                    call?.let { preloadCalls.remove(url, it) }
+                    slot.ready.countDown()
+
+                    if (slot.image == null) {
+                        preloadSlots.remove(url, slot)
+                        scheduleNextPreload()
+                    }
+                }
+            }
+
+            return
+        }
+    }
 
     override val supportsLatest: Boolean
         get() = lang != "all"
@@ -64,32 +311,77 @@ abstract class HentaiEnvy : KeiSource() {
     }
 
     private fun Document.toMangasPage(): MangasPage {
-        val mangas = select(".overview_thumbs .thumb, .box_thumbs .thumb")
-            .mapNotNull(::mangaFromElement)
+        val cards = select(
+            "article.hnv-gallery-card, " +
+                ".overview_thumbs .thumb, " +
+                ".box_thumbs .thumb",
+        )
 
-        val hasNextPage = select("ul.pagination a[href], a.page-link[href]")
-            .any { it.text().trim().equals("Next", ignoreCase = true) }
+        val mangas = cards
+            .mapNotNull(::mangaFromElement)
+            .distinctBy { it.url }
+
+        val hasNextPage =
+            selectFirst("a[rel=next][href]") != null ||
+                select("ul.pagination a[href], a.page-link[href]")
+                    .any {
+                        it.text()
+                            .trim()
+                            .startsWith("Next", ignoreCase = true)
+                    }
 
         return MangasPage(mangas, hasNextPage)
     }
 
     private fun mangaFromElement(element: Element): SManga? {
-        val link = element.selectFirst(
-            "a[href*=/gallery/][title], a[href*=/gallery/]",
+        val titleLink = element.selectFirst(
+            ".hnv-gallery-card__title a[href*=/gallery/], " +
+                "a[href*=/gallery/][title], " +
+                "a[href*=/gallery/]",
         ) ?: return null
 
-        val title = link.attr("title").trim().ifBlank {
-            link.selectFirst(".title")?.text()?.trim().orEmpty()
-        }
+        val title = element
+            .selectFirst(".hnv-gallery-card__title")
+            ?.text()
+            ?.trim()
+            .orEmpty()
+            .ifBlank {
+                titleLink.attr("title")
+                    .trim()
+                    .removePrefix("Open ")
+                    .trim()
+            }
+            .ifBlank {
+                titleLink.attr("aria-label")
+                    .trim()
+                    .removePrefix("Open ")
+                    .trim()
+            }
+            .ifBlank {
+                titleLink.selectFirst(".title")
+                    ?.text()
+                    ?.trim()
+                    .orEmpty()
+            }
+
         if (title.isBlank()) return null
 
-        val href = link.attr("abs:href").ifBlank { link.attr("href") }
+        val href = titleLink
+            .attr("abs:href")
+            .ifBlank { titleLink.attr("href") }
+
         if (href.isBlank()) return null
+
+        val image = element.selectFirst(
+            ".hnv-gallery-card__cover img, " +
+                ".hnv-gallery-card__media img, " +
+                "img",
+        )
 
         return SManga.create().apply {
             this.title = title
             setUrlWithoutDomain(href)
-            thumbnail_url = link.selectFirst("img")?.imageUrl()
+            thumbnail_url = image?.imageUrl()
         }
     }
 
@@ -132,69 +424,70 @@ abstract class HentaiEnvy : KeiSource() {
     }
 
     private fun Document.parseMangaDetails(): SManga = SManga.create().apply {
-        title = selectFirst("head > title")
+        title = selectFirst("#gallery-title, h1")
             ?.text()
-            ?.replace(
-                Regex("""\s*-\s*HentaiEnvy\s*$""", RegexOption.IGNORE_CASE),
-                "",
-            )
             ?.trim()
             .orEmpty()
-            .ifBlank { selectFirst("h1")?.text()?.trim().orEmpty() }
+            .ifBlank {
+                selectFirst("head > title")
+                    ?.text()
+                    ?.replace(
+                        Regex("""\s*-\s*HentaiEnvy\s*$""", RegexOption.IGNORE_CASE),
+                        "",
+                    )
+                    ?.trim()
+                    .orEmpty()
+            }
 
         thumbnail_url = selectFirst(
-            "img[data-src*=cover], img[src*=cover]",
+            ".hnv-gallery-cover img, " +
+                "img[data-src*=cover], " +
+                "img[src*=cover]",
         )?.imageUrl()
 
-        val authors = select("a[href^=/artist/]")
-            .map { capitalizeName(it.ownText()) }
-            .filter(String::isNotBlank)
+        val authors = entityValues("Artists")
+            .map(::capitalizeName)
             .distinct()
 
-        val groups = select("a[href^=/group/]")
-            .map { capitalizeName(it.ownText()) }
-            .filter(String::isNotBlank)
+        val groups = entityValues("Groups")
+            .map(::capitalizeName)
             .distinct()
 
         when {
             authors.isNotEmpty() -> {
                 author = authors.joinToString(", ")
-                artist = groups.joinToString(", ").takeIf(String::isNotBlank)
+                artist = groups
+                    .joinToString(", ")
+                    .takeIf(String::isNotBlank)
             }
+
             groups.isNotEmpty() -> {
                 author = groups.joinToString(", ")
                 artist = null
             }
+
             else -> {
                 author = null
                 artist = null
             }
         }
 
-        genre = select("a.gp_tag[href^=/tag/]")
-            .map { it.ownText().trim() }
-            .filter(String::isNotBlank)
-            .distinct()
+        genre = entityValues("Tags")
+            .distinctBy { it.lowercase() }
             .joinToString(", ")
             .takeIf(String::isNotBlank)
 
-        val language = selectFirst(
-            "a[aria-label=g_language][href^=/language/]",
-        )
-            ?.attr("href")
-            ?.substringAfter("/language/", "")
-            ?.substringBefore("/")
-            ?.takeIf(String::isNotBlank)
-            ?.replaceFirstChar { c -> if (c.isLowerCase()) c.titlecase() else c.toString() }
+        val language = entityValues("Languages")
+            .firstOrNull()
+            ?.replaceFirstChar { c ->
+                if (c.isLowerCase()) c.titlecase() else c.toString()
+            }
 
-        val category = selectFirst(
-            ".gallery_info .category a[href^=/category/], " +
-                ".g_info .category a[href^=/category/], " +
-                ".category a[href^=/category/]",
-        )
-            ?.ownText()
-            ?.trim()
-            ?.takeIf(String::isNotBlank)
+        val category = entityValues("Category")
+            .firstOrNull()
+            ?.replaceFirstChar { c ->
+                if (c.isLowerCase()) c.titlecase() else c.toString()
+            }
 
         description = buildList {
             language?.let { add("$languageLabel: $it") }
@@ -207,6 +500,56 @@ abstract class HentaiEnvy : KeiSource() {
         initialized = true
     }
 
+    private fun Document.entityValues(label: String): List<String> {
+        val group = select(".hnv-gallery-entity-group")
+            .firstOrNull { element ->
+                element
+                    .selectFirst(".hnv-gallery-entity-label")
+                    ?.text()
+                    ?.trim()
+                    ?.removeSuffix(":")
+                    ?.equals(label, ignoreCase = true) == true
+            }
+            ?: return emptyList()
+
+        val named = group
+            .select(".hnv-gallery-tag__name")
+            .map { it.text().trim() }
+            .filter(String::isNotBlank)
+
+        if (named.isNotEmpty()) {
+            return named
+        }
+
+        return group
+            .select(".hnv-gallery-entity-items a")
+            .map { element ->
+                element.attr("title")
+                    .trim()
+                    .ifBlank { element.text().trim() }
+            }
+            .filter(String::isNotBlank)
+    }
+
+    private fun Document.entityText(label: String): String? {
+        val group = select(".hnv-gallery-entity-group")
+            .firstOrNull { element ->
+                element
+                    .selectFirst(".hnv-gallery-entity-label")
+                    ?.text()
+                    ?.trim()
+                    ?.removeSuffix(":")
+                    ?.equals(label, ignoreCase = true) == true
+            }
+            ?: return null
+
+        return group
+            .selectFirst(".hnv-gallery-entity-items")
+            ?.text()
+            ?.trim()
+            ?.takeIf(String::isNotBlank)
+    }
+
     private fun Document.parseChapter(mangaUrl: String): SChapter = SChapter.create().apply {
         url = mangaUrl
         name = chapterLabel
@@ -215,53 +558,92 @@ abstract class HentaiEnvy : KeiSource() {
         date_upload = 0L
     }
 
-    private fun Document.pageCount(): Int = selectFirst("#load_pages")?.attr("value")?.toIntOrNull() ?: 0
+    private fun Document.pageCount(): Int {
+        val pagesGroup = select(".hnv-gallery-entity-group")
+            .firstOrNull { element ->
+                element
+                    .selectFirst(".hnv-gallery-entity-label")
+                    ?.text()
+                    ?.trim()
+                    ?.removeSuffix(":")
+                    ?.equals("Pages", ignoreCase = true) == true
+            }
+
+        pagesGroup
+            ?.text()
+            ?.let { text ->
+                Regex("""\d+""")
+                    .find(text)
+                    ?.value
+                    ?.toIntOrNull()
+            }
+            ?.let { return it }
+
+        selectFirst(".hnv-gallery-metadata")
+            ?.text()
+            ?.let { metadata ->
+                Regex(
+                    """(?i)\bPages\s*:\s*(\d+)""",
+                )
+                    .find(metadata)
+                    ?.groupValues
+                    ?.getOrNull(1)
+                    ?.toIntOrNull()
+            }
+            ?.let { return it }
+
+        return selectFirst("#load_pages")
+            ?.attr("value")
+            ?.toIntOrNull()
+            ?: 0
+    }
 
     override suspend fun getPageList(chapter: SChapter): List<Page> {
-        val chapterUrl = getChapterUrl(chapter)
-        val response = client.get(chapterUrl)
-        val body = response.use { it.body.string() }
-        val document = Jsoup.parse(body, chapterUrl)
-
-        val server = document.selectFirst("#load_server")?.attr("value")?.trim().orEmpty()
-        val directory = document.selectFirst("#load_dir")?.attr("value")?.trim().orEmpty()
-        val loadId = document.selectFirst("#load_id")?.attr("value")?.trim().orEmpty()
-        val pageCount = document.selectFirst("#load_pages")?.attr("value")?.toIntOrNull()
-            ?: return emptyList()
-
-        if (
-            server.isBlank() ||
-            directory.isBlank() ||
-            loadId.isBlank() ||
-            pageCount <= 0
-        ) {
-            return emptyList()
-        }
-
-        val gThJson = G_TH_BLOCK_REGEX
-            .find(body)
+        val galleryUrl = getChapterUrl(chapter)
+        val galleryId = GALLERY_ID_REGEX
+            .find(galleryUrl)
             ?.groupValues
             ?.getOrNull(1)
             ?: return emptyList()
 
-        val formats = G_TH_ENTRY_REGEX.findAll(gThJson).associate { match ->
-            match.groupValues[1].toInt() to match.groupValues[2].lowercase()
+        val readerUrl = "$baseUrl/g/$galleryId/1/"
+        val response = client.get(readerUrl)
+        val body = response.use { it.body.string() }
+        val document = Jsoup.parse(body, readerUrl)
+
+        val imageBase = document
+            .selectFirst("#readerApp[data-reader-image-base]")
+            ?.attr("data-reader-image-base")
+            ?.trim()
+            ?.trimEnd('/')
+            .orEmpty()
+
+        if (imageBase.isBlank()) {
+            return emptyList()
         }
 
-        val mediaHost = "https://m$server.${baseUrl.toHttpUrl().host}"
+        val formats = READER_PAGE_REGEX
+            .findAll(body)
+            .associate { match ->
+                match.groupValues[1].toInt() to match.groupValues[2].lowercase()
+            }
 
-        return (1..pageCount).mapNotNull { pageNumber ->
-            val extension = when (formats[pageNumber]) {
-                "j" -> "jpg"
-                "w" -> "webp"
-                else -> null
-            } ?: return@mapNotNull null
-
-            Page(
-                index = pageNumber - 1,
-                imageUrl = "$mediaHost/$directory/$loadId/$pageNumber.$extension",
-            )
+        if (formats.isEmpty()) {
+            return emptyList()
         }
+
+        val pages = formats
+            .toSortedMap()
+            .map { (pageNumber, extension) ->
+                Page(
+                    index = pageNumber - 1,
+                    imageUrl = "$imageBase/$pageNumber.$extension",
+                )
+            }
+
+        preparePreload(pages.mapNotNull { it.imageUrl })
+
+        return pages
     }
 
     override fun getFilterList(data: JsonElement?): FilterList = FilterList()
@@ -339,13 +721,18 @@ abstract class HentaiEnvy : KeiSource() {
     }
 
     private companion object {
-        val G_TH_BLOCK_REGEX = Regex(
-            """var\s+g_th\s*=\s*\$\.parseJSON\(\s*'(\{.*?\})'\s*\)""",
-            RegexOption.DOT_MATCHES_ALL,
+        const val PRELOAD_WINDOW = 10
+        const val PRELOAD_WAIT_SECONDS = 15L
+        const val PRELOAD_HEADER = "X-RBK-Preload"
+
+        val GALLERY_ID_REGEX = Regex(
+            """/gallery/(\d+)/?""",
+            RegexOption.IGNORE_CASE,
         )
 
-        val G_TH_ENTRY_REGEX = Regex(
-            """"(\d+)":"([A-Za-z]),(\d+),(\d+)"""",
+        val READER_PAGE_REGEX = Regex(
+            """"page"\s*:\s*(\d+)\s*,\s*"ext"\s*:\s*"([A-Za-z0-9]+)"""",
+            RegexOption.IGNORE_CASE,
         )
     }
 }

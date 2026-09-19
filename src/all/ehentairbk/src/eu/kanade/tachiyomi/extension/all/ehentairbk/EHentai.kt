@@ -22,15 +22,286 @@ import kotlinx.serialization.json.JsonElement
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.Interceptor
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.OkHttpClient
+import okhttp3.Protocol
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URLDecoder
 import java.time.format.DateTimeFormatter
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 @Source
 abstract class EHentai : KeiSource() {
+
+    override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder = addInterceptor(ReaderPreloadInterceptor())
+
+    private data class CachedImage(
+        val bytes: ByteArray,
+        val contentType: String?,
+    )
+
+    private class PreloadSlot {
+        val ready = CountDownLatch(1)
+
+        @Volatile var image: CachedImage? = null
+    }
+
+    private data class ReaderPreloadContext(
+        val gid: Long,
+        val pages: List<Page>,
+    )
+
+    private val preloadExecutor by lazy { Executors.newFixedThreadPool(PRELOAD_WINDOW) }
+    private val preloadSlots by lazy { ConcurrentHashMap<String, PreloadSlot>() }
+    private val preloadCalls by lazy { ConcurrentHashMap<String, okhttp3.Call>() }
+    private val preloadLock by lazy { Any() }
+
+    @Volatile private var readerPreloadContext: ReaderPreloadContext? = null
+
+    @Volatile private var preloadOrder: List<Int> = emptyList()
+
+    @Volatile private var nextPreloadOrderIndex = 0
+
+    @Volatile private var preloadGeneration = 0L
+
+    @Volatile private var lastReaderIndex: Int? = null
+
+    @Volatile private var readerDirection = 1
+
+    private inner class ReaderPreloadInterceptor : Interceptor {
+        override fun intercept(chain: Interceptor.Chain): Response {
+            val original = chain.request()
+
+            if (original.header(PRELOAD_HEADER) != null) {
+                return chain.proceed(
+                    original.newBuilder()
+                        .removeHeader(PRELOAD_HEADER)
+                        .build(),
+                )
+            }
+
+            val slot = preloadSlots[original.url.toString()]
+                ?: return chain.proceed(original)
+
+            val ready = runCatching {
+                slot.ready.await(PRELOAD_WAIT_SECONDS, TimeUnit.SECONDS)
+            }.getOrDefault(false)
+
+            val cached = if (ready) slot.image else null
+            if (cached == null) {
+                preloadSlots.remove(original.url.toString(), slot)
+                scheduleNextPreload()
+                return chain.proceed(original)
+            }
+
+            preloadSlots.remove(original.url.toString(), slot)
+            scheduleNextPreload()
+
+            return Response.Builder()
+                .request(original)
+                .protocol(Protocol.HTTP_1_1)
+                .code(200)
+                .message("OK")
+                .body(
+                    cached.bytes.toResponseBody(
+                        cached.contentType
+                            ?.takeIf(String::isNotBlank)
+                            ?.toMediaTypeOrNull(),
+                    ),
+                )
+                .build()
+        }
+    }
+
+    private fun prepareReaderPreload(
+        gid: Long,
+        pages: List<Page>,
+    ) {
+        synchronized(preloadLock) {
+            cancelActivePreloadsLocked()
+            preloadSlots.clear()
+            readerPreloadContext = ReaderPreloadContext(gid, pages)
+            lastReaderIndex = null
+            readerDirection = 1
+            setPreloadOrderLocked(anchor = 0, direction = 1)
+            repeat(minOf(PRELOAD_WINDOW, preloadOrder.size)) {
+                scheduleNextPreloadLocked()
+            }
+        }
+    }
+
+    private fun updateReaderPosition(
+        gid: Long,
+        targetPage: Int,
+    ) {
+        val context = readerPreloadContext
+            ?.takeIf { it.gid == gid }
+            ?: return
+
+        val index = (targetPage - 1)
+            .coerceIn(0, context.pages.lastIndex)
+
+        synchronized(preloadLock) {
+            val previous = lastReaderIndex
+            if (previous == null) {
+                lastReaderIndex = index
+                return
+            }
+
+            val delta = index - previous
+            if (delta == 0) return
+
+            val newDirection = if (delta > 0) 1 else -1
+            val directionChanged = newDirection != readerDirection
+            val jumped = kotlin.math.abs(delta) > 1
+
+            lastReaderIndex = index
+
+            if (directionChanged || jumped) {
+                readerDirection = newDirection
+                cancelActivePreloadsLocked()
+                preloadSlots.clear()
+                setPreloadOrderLocked(
+                    anchor = index,
+                    direction = newDirection,
+                )
+                repeat(minOf(PRELOAD_WINDOW, preloadOrder.size)) {
+                    scheduleNextPreloadLocked()
+                }
+            }
+        }
+    }
+
+    private fun setPreloadOrderLocked(
+        anchor: Int,
+        direction: Int,
+    ) {
+        val pages = readerPreloadContext?.pages.orEmpty()
+        preloadGeneration++
+
+        preloadOrder = if (direction > 0) {
+            (anchor until pages.size).toList()
+        } else {
+            (anchor downTo 0).toList()
+        }
+
+        nextPreloadOrderIndex = 0
+    }
+
+    private fun cancelActivePreloadsLocked() {
+        preloadCalls.values.forEach { it.cancel() }
+        preloadCalls.clear()
+    }
+
+    private fun scheduleNextPreload() {
+        synchronized(preloadLock) {
+            scheduleNextPreloadLocked()
+        }
+    }
+
+    private fun scheduleNextPreloadLocked() {
+        val context = readerPreloadContext ?: return
+
+        while (nextPreloadOrderIndex < preloadOrder.size) {
+            val index = preloadOrder[nextPreloadOrderIndex++]
+            val page = context.pages.getOrNull(index) ?: continue
+            val generation = preloadGeneration
+
+            preloadExecutor.execute {
+                if (generation != preloadGeneration) return@execute
+
+                val imageUrl = runCatching {
+                    kotlinx.coroutines.runBlocking {
+                        resolveImageUrlForPreload(page)
+                    }
+                }.getOrNull()
+
+                if (
+                    imageUrl.isNullOrBlank() ||
+                    generation != preloadGeneration
+                ) {
+                    scheduleNextPreload()
+                    return@execute
+                }
+
+                val slot = PreloadSlot()
+                if (preloadSlots.putIfAbsent(imageUrl, slot) != null) {
+                    scheduleNextPreload()
+                    return@execute
+                }
+
+                var call: okhttp3.Call? = null
+
+                try {
+                    val request = Request.Builder()
+                        .url(imageUrl)
+                        .headers(headers)
+                        .header(PRELOAD_HEADER, "1")
+                        .get()
+                        .build()
+
+                    call = client.newCall(request)
+                    preloadCalls[imageUrl] = call
+
+                    call.execute().use { response ->
+                        if (
+                            generation == preloadGeneration &&
+                            response.isSuccessful
+                        ) {
+                            slot.image = CachedImage(
+                                bytes = response.body.bytes(),
+                                contentType = response.header("Content-Type"),
+                            )
+                        }
+                    }
+                } catch (_: Exception) {
+                    // Mihon conserva su descarga normal como fallback.
+                } finally {
+                    call?.let { preloadCalls.remove(imageUrl, it) }
+                    slot.ready.countDown()
+
+                    if (slot.image == null) {
+                        preloadSlots.remove(imageUrl, slot)
+                    }
+
+                    scheduleNextPreload()
+                }
+            }
+
+            return
+        }
+    }
+
+    private suspend fun resolveImageUrlForPreload(page: Page): String {
+        val marker = page.url.substringAfter('#', "")
+
+        val gid = marker
+            .substringAfter("gid=", "")
+            .substringBefore('&')
+            .toLongOrNull()
+            ?: error("Reader gid not found")
+
+        val targetPage = marker
+            .substringAfter("page=", "")
+            .substringBefore('&')
+            .toIntOrNull()
+            ?: error("Reader page not found")
+
+        return resolveReaderImageUrl(
+            gid = gid,
+            targetPage = targetPage,
+        )
+    }
 
     private val cursorPages = linkedMapOf<String, MutableMap<Int, HttpUrl>>()
     private val readerStates = linkedMapOf<Long, ReaderState>()
@@ -279,12 +550,19 @@ abstract class EHentai : KeiSource() {
             readerStates[gid] = state
         }
 
-        return (1..pageCount).map { pageNumber ->
+        val pages = (1..pageCount).map { pageNumber ->
             Page(
                 index = pageNumber - 1,
                 url = "$firstReaderUrl#gid=$gid&page=$pageNumber",
             )
         }
+
+        prepareReaderPreload(
+            gid = gid,
+            pages = pages,
+        )
+
+        return pages
     }
 
     override suspend fun getImageUrl(page: Page): String {
@@ -302,11 +580,28 @@ abstract class EHentai : KeiSource() {
             .toIntOrNull()
             ?: error("Reader page not found")
 
+        updateReaderPosition(
+            gid = gid,
+            targetPage = targetPage,
+        )
+
+        return resolveReaderImageUrl(
+            gid = gid,
+            targetPage = targetPage,
+        )
+    }
+
+    private suspend fun resolveReaderImageUrl(
+        gid: Long,
+        targetPage: Int,
+    ): String {
         val state = synchronized(readerStates) {
             readerStates[gid]
         } ?: error("Reader state expired")
 
-        state.images[targetPage]?.let {
+        synchronized(state.images) {
+            state.images[targetPage]
+        }?.let {
             return it
         }
 
@@ -1187,6 +1482,10 @@ abstract class EHentai : KeiSource() {
     )
 
     companion object {
+        private const val PRELOAD_WINDOW = 10
+        private const val PRELOAD_WAIT_SECONDS = 15L
+        private const val PRELOAD_HEADER = "X-RBK-Preload"
+
         private val LANGUAGE_NAMES = mapOf(
             "en" to "english",
             "es" to "spanish",
