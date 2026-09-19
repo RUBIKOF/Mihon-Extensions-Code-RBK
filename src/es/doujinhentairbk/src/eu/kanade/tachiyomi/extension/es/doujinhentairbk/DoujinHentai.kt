@@ -766,7 +766,6 @@ abstract class DoujinHentai : KeiSource() {
         const val PRELOAD_WINDOW = 10
         const val PRELOAD_WAIT_SECONDS = 15L
         const val PRELOAD_HEADER = "X-RBK-Preload"
-
         val pageRegex = Regex(
             """https?://[^"'\\\s<>]+?\.(?:jpg|jpeg|png|webp|avif)(?:\?[^"'\\\s<>]*)?""",
             RegexOption.IGNORE_CASE,
